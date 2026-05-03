@@ -11,6 +11,8 @@ BUCKET = "sagemaker-studio-i0gutcxdy"
 RESULTS_PREFIX = "frustration-model/results/"
 FEATURES_PREFIX = "frustration-model/preprocessed_data/"
 
+RECENT_RUNS_TO_CHECK = 3
+
 app = Flask(__name__)
 CORS(app)
 
@@ -37,35 +39,12 @@ def list_s3_objects(prefix: str):
     return response.get("Contents", [])
 
 
-def get_latest_prediction_run():
-    """
-    Finds the newest prediction CSV file.
+def parse_prediction_file(obj):
+    key = obj["Key"]
+    filename = key.split("/")[-1]
 
-    Supports old format:
-      predictions_Run_009_20260309_0249.csv
-
-    Supports new format:
-      predictions_model_v0_run197_20260425_1801.csv
-    """
-    contents = list_s3_objects(RESULTS_PREFIX)
-
-    run_files = [
-        obj for obj in contents
-        if obj["Key"].endswith(".csv")
-        and (
-            "predictions_Run_" in obj["Key"]
-            or "predictions_model_v0_" in obj["Key"]
-        )
-    ]
-
-    if not run_files:
-        raise FileNotFoundError(
-            f"No supported prediction files found under s3://{BUCKET}/{RESULTS_PREFIX}"
-        )
-
-    latest = max(run_files, key=lambda x: x["LastModified"])
-    latest_key = latest["Key"]
-    filename = latest_key.split("/")[-1]
+    if not filename.endswith(".csv"):
+        return None
 
     if filename.startswith("predictions_Run_"):
         run_suffix = filename.replace("predictions_Run_", "").replace(".csv", "")
@@ -74,15 +53,45 @@ def get_latest_prediction_run():
         run_suffix = filename.replace("predictions_model_v0_", "").replace(".csv", "")
         naming_format = "new"
     else:
-        raise ValueError(f"Unsupported prediction filename format: {filename}")
+        return None
 
-    return run_suffix, latest_key, naming_format
+    return {
+        "key": key,
+        "filename": filename,
+        "runSuffix": run_suffix,
+        "namingFormat": naming_format,
+        "lastModified": obj["LastModified"],
+    }
+
+
+def get_prediction_runs():
+    contents = list_s3_objects(RESULTS_PREFIX)
+
+    runs = []
+    for obj in contents:
+        parsed = parse_prediction_file(obj)
+        if parsed:
+            runs.append(parsed)
+
+    if not runs:
+        raise FileNotFoundError(
+            f"No supported prediction files found under s3://{BUCKET}/{RESULTS_PREFIX}"
+        )
+
+    runs.sort(key=lambda x: x["lastModified"], reverse=True)
+    return runs
+
+
+def get_latest_prediction_run():
+    latest = get_prediction_runs()[0]
+    return latest["runSuffix"], latest["key"], latest["namingFormat"]
+
+
+def get_recent_prediction_runs(limit=RECENT_RUNS_TO_CHECK):
+    return get_prediction_runs()[:limit]
 
 
 def get_matching_features_key(run_suffix: str, naming_format: str):
-    """
-    Matches prediction file to the correct feature file.
-    """
     if naming_format == "new":
         return f"{FEATURES_PREFIX}features_model_v0_{run_suffix}.csv"
 
@@ -97,10 +106,35 @@ def s3_key_exists(key: str) -> bool:
         return False
 
 
+def get_ongoing_session_ids():
+    """
+    Prototype heuristic:
+    If a sessionId appears in the latest run AND at least one recent previous run,
+    mark it as ONGOING. Otherwise, mark it as ENDED.
+    """
+    recent_runs = get_recent_prediction_runs(RECENT_RUNS_TO_CHECK)
+
+    if len(recent_runs) < 2:
+        return set()
+
+    latest_df = load_csv_from_s3(recent_runs[0]["key"])
+    latest_ids = set(latest_df["sessionId"].dropna().astype(str))
+
+    previous_ids = set()
+
+    for run in recent_runs[1:]:
+        try:
+            df = load_csv_from_s3(run["key"])
+            if "sessionId" in df.columns:
+                previous_ids.update(df["sessionId"].dropna().astype(str))
+        except Exception as e:
+            print(f"Could not load previous run {run['key']}: {e}")
+
+    ongoing_ids = latest_ids.intersection(previous_ids)
+    return ongoing_ids
+
+
 def load_matching_feature_vectors():
-    """
-    Load the features file that matches the latest predictions run.
-    """
     run_suffix, _predictions_key, naming_format = get_latest_prediction_run()
     features_key = get_matching_features_key(run_suffix, naming_format)
 
@@ -115,9 +149,6 @@ def load_matching_feature_vectors():
 
 
 def load_sessions():
-    """
-    Load latest predictions and join with matching feature data.
-    """
     run_suffix, predictions_key, _naming_format = get_latest_prediction_run()
     df_pred = load_csv_from_s3(predictions_key)
     print("PREDICTIONS COLUMNS:", df_pred.columns.tolist())
@@ -125,12 +156,15 @@ def load_sessions():
     _, features_key, df_feat = load_matching_feature_vectors()
     print("FEATURES COLUMNS:", df_feat.columns.tolist())
 
+    ongoing_ids = get_ongoing_session_ids()
+    print(f"ONGOING SESSION COUNT: {len(ongoing_ids)}")
+
     sessions = []
 
     for _, r in df_pred.iterrows():
-        session_id = r.get("sessionId")
+        session_id = str(r.get("sessionId"))
 
-        feature_row = df_feat[df_feat["sessionId"] == session_id]
+        feature_row = df_feat[df_feat["sessionId"].astype(str) == session_id]
 
         event_count = None
         if not feature_row.empty:
@@ -142,7 +176,7 @@ def load_sessions():
             "severity": to_upper_severity(r.get("severity")),
             "timestamp": r.get("timestamp"),
             "scenario": r.get("scenario", "—"),
-            "status": "ENDED",
+            "status": "ONGOING" if session_id in ongoing_ids else "ENDED",
             "events": event_count,
         })
 
@@ -155,6 +189,8 @@ def health():
         run_suffix, predictions_key, naming_format = get_latest_prediction_run()
         features_key = get_matching_features_key(run_suffix, naming_format)
         features_exists = s3_key_exists(features_key)
+        recent_runs = get_recent_prediction_runs()
+        ongoing_ids = get_ongoing_session_ids()
 
         return jsonify({
             "ok": True,
@@ -163,6 +199,8 @@ def health():
             "predictionsSource": f"s3://{BUCKET}/{predictions_key}",
             "matchingFeaturesSource": f"s3://{BUCKET}/{features_key}",
             "matchingFeaturesExists": features_exists,
+            "recentRunsChecked": [r["filename"] for r in recent_runs],
+            "ongoingSessionCount": len(ongoing_ids),
             "checkedAt": datetime.utcnow().isoformat() + "Z"
         })
     except Exception as e:
@@ -190,11 +228,43 @@ def session_by_id(session_id):
     return jsonify({"message": "Not found"}), 404
 
 
+@app.get("/api/alerts")
+def alerts():
+    _run_suffix, _predictions_key, session_rows = load_sessions()
+    alert_rows = [
+        s for s in session_rows
+        if s["severity"] in ["MEDIUM", "HIGH"]
+    ]
+    return jsonify(alert_rows)
+
+
+@app.get("/api/queue")
+def queue():
+    _run_suffix, _predictions_key, session_rows = load_sessions()
+
+    severity_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
+    status_rank = {"ONGOING": 0, "ENDED": 1}
+
+    sorted_rows = sorted(
+        session_rows,
+        key=lambda s: (
+            status_rank.get(s.get("status"), 1),
+            severity_rank.get(s.get("severity"), 2),
+            pd.to_datetime(s.get("timestamp"), errors="coerce")
+        )
+    )
+
+    for idx, row in enumerate(sorted_rows, start=1):
+        row["queuePosition"] = idx
+
+    return jsonify(sorted_rows)
+
+
 @app.get("/api/sessions/<session_id>/metrics")
 def session_metrics(session_id):
     run_suffix, features_key, df = load_matching_feature_vectors()
 
-    row = df[df["sessionId"] == session_id]
+    row = df[df["sessionId"].astype(str) == str(session_id)]
 
     print("\n=== RAW FEATURE ROW ===")
     print(row.to_dict(orient="records"))

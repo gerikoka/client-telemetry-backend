@@ -29,7 +29,7 @@ end
 # unset irrelevant variables
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV "/Users/gerikoka/Desktop/backend/sou%"
+set -gx VIRTUAL_ENV "/Users/gerikoka/Desktop/client-telemetry-backend/sou%"
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/bin" $PATH

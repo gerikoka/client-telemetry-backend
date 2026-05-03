@@ -37,7 +37,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV="/Users/gerikoka/Desktop/backend/sou%"
+VIRTUAL_ENV="/Users/gerikoka/Desktop/client-telemetry-backend/sou%"
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"
