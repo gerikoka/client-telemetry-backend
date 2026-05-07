@@ -13,6 +13,16 @@ FEATURES_PREFIX = "frustration-model/preprocessed_data/"
 
 RECENT_RUNS_TO_CHECK = 3
 
+# Demo-only setting:
+# This does NOT change S3 data. It only changes what the dashboard displays.
+DEMO_SIMULATE_ONGOING = True
+
+DEMO_ONGOING_SESSION_IDS = {
+    "S-pw1-1772502475925-7915",
+    "S1772502490686-2410",
+    "S-pw7-1772502511498-1982",
+}
+
 app = Flask(__name__)
 CORS(app)
 
@@ -108,7 +118,7 @@ def s3_key_exists(key: str) -> bool:
 
 def get_ongoing_session_ids():
     """
-    Prototype heuristic:
+    Real prototype heuristic:
     If a sessionId appears in the latest run AND at least one recent previous run,
     mark it as ONGOING. Otherwise, mark it as ENDED.
     """
@@ -157,7 +167,8 @@ def load_sessions():
     print("FEATURES COLUMNS:", df_feat.columns.tolist())
 
     ongoing_ids = get_ongoing_session_ids()
-    print(f"ONGOING SESSION COUNT: {len(ongoing_ids)}")
+    print(f"ONGOING SESSION COUNT FROM REAL RUN MATCHING: {len(ongoing_ids)}")
+    print(f"DEMO SIMULATE ONGOING: {DEMO_SIMULATE_ONGOING}")
 
     sessions = []
 
@@ -170,13 +181,23 @@ def load_sessions():
         if not feature_row.empty:
             event_count = int(feature_row.iloc[0].get("event_count", 0) or 0)
 
+        score = float(r.get("frustrationScore") or 0)
+
+        real_status = "ONGOING" if session_id in ongoing_ids else "ENDED"
+
+        demo_status = (
+            "ONGOING"
+            if DEMO_SIMULATE_ONGOING and session_id in DEMO_ONGOING_SESSION_IDS
+            else real_status
+        )
+
         sessions.append({
             "sessionId": session_id,
-            "frustrationScore": float(r.get("frustrationScore")),
+            "frustrationScore": score,
             "severity": to_upper_severity(r.get("severity")),
             "timestamp": r.get("timestamp"),
             "scenario": r.get("scenario", "—"),
-            "status": "ONGOING" if session_id in ongoing_ids else "ENDED",
+            "status": demo_status,
             "events": event_count,
         })
 
@@ -200,7 +221,9 @@ def health():
             "matchingFeaturesSource": f"s3://{BUCKET}/{features_key}",
             "matchingFeaturesExists": features_exists,
             "recentRunsChecked": [r["filename"] for r in recent_runs],
-            "ongoingSessionCount": len(ongoing_ids),
+            "ongoingSessionCountFromRealRunMatching": len(ongoing_ids),
+            "demoSimulateOngoing": DEMO_SIMULATE_ONGOING,
+            "demoOngoingSessionIds": list(DEMO_ONGOING_SESSION_IDS),
             "checkedAt": datetime.utcnow().isoformat() + "Z"
         })
     except Exception as e:
