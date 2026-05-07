@@ -46,6 +46,7 @@ def load_csv_from_s3(key: str) -> pd.DataFrame:
 
 def list_s3_objects(prefix: str):
     response = s3.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+    print("RAW S3 RESPONSE KEYS:", [obj["Key"] for obj in response.get("Contents", [])[:10]])
     return response.get("Contents", [])
 
 
@@ -249,6 +250,94 @@ def session_by_id(session_id):
             return jsonify(s)
 
     return jsonify({"message": "Not found"}), 404
+
+@app.get("/api/sessions/<session_id>/events")
+def get_session_events(session_id):
+    import json
+
+    # 🔥 Use RAW DATA bucket (ONLY for this route)
+    bucket = "sagemaker-us-east-1-197337164107"
+    prefix = "raw/"
+
+    events = []
+
+    print("EVENT ROUTE HIT:", session_id)
+    print("USING BUCKET:", bucket)
+    print("USING PREFIX:", prefix)
+
+    # Get all files under raw date folder
+    files = []
+    continuation_token = None
+
+    while True:
+        kwargs = {
+            "Bucket": bucket,
+            "Prefix": prefix
+        }
+
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+
+        response = s3.list_objects_v2(**kwargs)
+        files.extend(response.get("Contents", []))
+
+        if not response.get("IsTruncated"):
+            break
+
+        continuation_token = response.get("NextContinuationToken")
+    print("RAW FILES:", [obj["Key"] for obj in files])
+
+    for obj in files:
+        key = obj["Key"]
+
+        # Only process ndjson logs
+        if not key.endswith(".ndjson"):
+            continue
+
+        try:
+            file_obj = s3.get_object(Bucket=bucket, Key=key)
+            content = file_obj["Body"].read().decode("utf-8")
+
+            for line in content.splitlines():
+                try:
+                    event = json.loads(line)
+
+                    # Handle different possible sessionId formats
+                    event_session_id = (
+                        event.get("sessionId")
+                        or event.get("session_id")
+                        or event.get("sessionID")
+                        or event.get("metadata", {}).get("sessionId")
+                    )
+
+                    pw_part = session_id.split("-")[1]   # pw706
+                    pw_number = pw_part.replace("pw", "")
+
+                    event_user_id = str(event.get("userId", ""))
+
+                    if pw_number in event_user_id:
+                        events.append({
+                            "timestamp": event.get("timestamp") or event.get("time"),
+                            "eventType": event.get("eventType") or event.get("event") or event.get("type"),
+                            "pageRoute": event.get("pageRoute") or event.get("route") or event.get("url"),
+                            "userId": event.get("userId") or event.get("user_id"),
+                            "metadata": event.get("metadata", {})
+                        })
+
+                except Exception as e:
+                    print("Skipping bad line:", e)
+                    continue
+
+        except Exception as e:
+            print("Error reading file:", key, e)
+            continue
+
+    # Sort timeline by timestamp
+    events.sort(key=lambda e: str(e.get("timestamp", "")))
+
+    print("TOTAL EVENTS FOUND:", len(events))
+
+    return jsonify(events), 200
 
 
 @app.get("/api/alerts")
